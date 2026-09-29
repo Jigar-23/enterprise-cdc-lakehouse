@@ -1,49 +1,79 @@
-version: '3.8'
+name: enterprise-cdc-lakehouse
 
 services:
-  # 1. Source Relational Database (Simulating SAP / ERP Transactional Store)
+  # -------------------------------------------------------------
+  # 1. Source Relational Database: PostgreSQL 15 with WAL Logical Replication
+  # -------------------------------------------------------------
   postgres-source:
     image: debezium/postgres:15-alpine
     container_name: cdc_postgres_source
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: erp_admin
-      POSTGRES_PASSWORD: erp_password
-      POSTGRES_DB: erp_database
+      POSTGRES_USER: ${POSTGRES_USER:-erp_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_secure_password123}
+      POSTGRES_DB: ${POSTGRES_DB:-erp_database}
     volumes:
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U erp_admin -d erp_database"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_admin} -d ${POSTGRES_DB:-erp_database}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  # 2. High-Performance Event Streaming Broker (Redpanda - Kafka API Compatible)
+  # -------------------------------------------------------------
+  # 2. Event Streaming Broker: Redpanda (Kafka API v23.3 Compatible)
+  # -------------------------------------------------------------
   kafka:
     image: docker.redpanda.com/redpandadata/redpanda:v23.3.11
     container_name: cdc_kafka_broker
+    restart: unless-stopped
     command:
-      - redpanda start
-      - --smp 1
-      - --memory 512M
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - 512M
       - --overprovisioned
-      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9094
-      - --advertise-kafka-addr PLAINTEXT://kafka:9092,OUTSIDE://localhost:9094
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - PLAINTEXT://kafka:9092,OUTSIDE://localhost:19092
     ports:
       - "9092:9092"
-      - "9094:9094"
+      - "19092:19092"
       - "9644:9644"
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -i healthy || exit 0"]
+      test: ["CMD-SHELL", "rpk cluster health | grep -iq 'healthy'"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # 3. Debezium Change Data Capture Connect Engine
-  debezium:
+  # -------------------------------------------------------------
+  # 2b. Redpanda Console: Web UI for Kafka Topics & Messages
+  # -------------------------------------------------------------
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: cdc_redpanda_console
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # -------------------------------------------------------------
+  # 3. Debezium Kafka Connect Engine (Logical Decoding via pgoutput)
+  # -------------------------------------------------------------
+  connect:
     image: debezium/connect:2.5
     container_name: cdc_debezium_connect
+    restart: unless-stopped
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
       GROUP_ID: 1
@@ -64,36 +94,33 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
-  # 4. S3-Compatible Object Storage for Medallion Lakehouse
-  minio:
-    image: minio/minio:RELEASE.2023-09-30T07-02-29Z
-    container_name: cdc_minio_storage
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadminpassword
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-
-  # 5. MinIO Bucket Initializer
-  minio-init:
-    image: minio/mc:latest
-    container_name: cdc_minio_init
+  # -------------------------------------------------------------
+  # 4. Stream Consumer & Lakehouse Processing Engine
+  # -------------------------------------------------------------
+  cdc-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: cdc_lakehouse_consumer
+    restart: unless-stopped
     depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      sleep 3;
-      /usr/bin/mc alias set local http://minio:9000 minioadmin minioadminpassword;
-      /usr/bin/mc mb local/lakehouse-bronze --ignore-existing;
-      /usr/bin/mc mb local/lakehouse-silver --ignore-existing;
-      /usr/bin/mc mb local/lakehouse-quarantine --ignore-existing;
-      exit 0;
-      "
+      kafka:
+        condition: service_healthy
+      connect:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_GROUP_ID: cdc_lakehouse_consumer_group
+      KAFKA_TOPIC_PREFIX: erp_cdc
+      LAKEHOUSE_STORAGE_DIR: /app/lakehouse_storage
+    volumes:
+      - ./lakehouse_storage:/app/lakehouse_storage
 
 volumes:
-  minio_data:
+  pg_data:

@@ -32,8 +32,12 @@ bronze/
 silver/
 gold/
 quarantine/
+lakehouse_storage/
 *.parquet
 *.duckdb
+
+# Secrets & Local Config
+.env
 
 # IDE & OS
 .idea/

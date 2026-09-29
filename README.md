@@ -1,161 +1,161 @@
-# Enterprise CDC & Delta Lakehouse Ingestion Platform
+# Enterprise CDC & Delta Lakehouse
 
-[![CI Pipeline](https://github.com/Jigar-23/enterprise-cdc-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Jigar-23/enterprise-cdc-lakehouse/actions)
-[![Python Version](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.14-blue.svg)](https://www.python.org/)
-[![Storage](https://img.shields.io/badge/Format-Parquet%20%2F%20Delta-orange.svg)](https://delta.io/)
-[![CDC Engine](https://img.shields.io/badge/CDC-Debezium%20%2B%20Postgres%20WAL-red.svg)](https://debezium.io/)
-[![Streaming Broker](https://img.shields.io/badge/Broker-Redpanda%20%2F%20Kafka-brightgreen.svg)](https://redpanda.com/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+A streaming Change Data Capture (CDC) pipeline that replicates changes from PostgreSQL Write-Ahead Logs (WAL) into an ACID Delta Lakehouse using a Medallion architecture (Bronze, Silver, Gold).
 
-A high-performance, log-based **Change Data Capture (CDC)** streaming lakehouse pipeline engineered for enterprise ERP workloads. Replicates sub-second relational state changes from **PostgreSQL Write-Ahead Logs (WAL)** into an ACID **Medallion Lakehouse** architecture (Bronze $\rightarrow$ Silver $\rightarrow$ Gold) with **idempotent upsert semantics (`MERGE INTO`)**, **out-of-order event reconciliation**, and an automated **Dead Letter Queue (DLQ)** for poison pill isolation.
+Built with Python, Debezium, Apache Kafka / Redpanda, `deltalake` (Rust-backed Delta Lake engine), and DuckDB.
 
 ---
 
-## Architecture Overview
+## Overview
+
+Traditional batch ETL pipelines that poll databases using `SELECT * WHERE updated_at > ?` have several drawbacks:
+- Query overhead and lock contention on operational OLTP tables.
+- Missed hard deletes (`DELETE` statements leave no updated timestamp).
+- Inability to capture intermediate row updates occurring between poll intervals.
+
+This project implements log-based CDC by reading PostgreSQL's Write-Ahead Log directly via Debezium and logical replication (`pgoutput`). Changes are streamed through Kafka topics and consumed into a Delta Lakehouse.
+
+### Architecture
 
 ```
-+-------------------+        +--------------------+        +---------------------+
-| PostgreSQL 15     |  WAL   | Debezium Connector | Kafka  | Redpanda / Kafka    |
-| (OLTP ERP System) |------->| (Kafka Connect)    |------->| (Event Streaming)   |
-| Orders, Inventory |        | pgoutput plugin    |        | Partitioned Topics  |
-+-------------------+        +--------------------+        +----------+----------+
-                                                                      |
-                                                                      | CDC Stream
-                                                                      v
-+---------------------------------------------------------------------+------------------+
-| Stream Ingestion & Delta Processing Engine (Python / Pydantic / PyArrow)               |
-|                                                                                        |
-|   1. Envelope & Contract Validation (Pydantic V2)                                      |
-|      +--> Schema Violations / Poison Pills ---------> [ Dead Letter Queue / Quarantine]|
-|                                                                                        |
-|   2. Bronze Layer: Append-Only Immutable Changelog (Parquet partitioned by date)       |
-|                                                                                        |
-|   3. Silver Layer: ACID MERGE INTO (Deduplication + Out-of-Order LSN Resolution)       |
-+---------------------------------------------------------------------+------------------+
-                                                                      |
-                                                                      v
-+---------------------------------------------------------------------+------------------+
-| Gold Analytics & OLAP Layer (DuckDB In-Process Engine)                                 |
-|   - Real-Time Critical Stock Alerts (< 500 units)                                      |
-|   - Revenue & Customer Order Velocity                                                  |
-|   - CDC Throughput & Replay Audits                                                     |
-+----------------------------------------------------------------------------------------+
+PostgreSQL (OLTP)
+   │  WAL (pgoutput)
+   ▼
+Debezium Connector (Kafka Connect)
+   │  CDC events
+   ▼
+Kafka / Redpanda
+   │
+   ▼
+Python CDC Consumer
+   ├── Validation (Pydantic) ──► Dead Letter Queue (quarantine/)
+   ├── Bronze Layer: Append-only raw event changelog (Delta Lake)
+   └── Silver Layer: Deduplicated state with ACID MERGE & monotonic LSN ordering (Delta Lake)
+         │
+         ▼
+      Gold Layer: Analytical queries & reports (DuckDB over Delta / Arrow)
 ```
 
 ---
 
-## Key Features
+## How It Works
 
-- **Log-Based CDC via PostgreSQL WAL:** Uses `pgoutput` and `REPLICA IDENTITY FULL` to capture insert, update, and hard-delete operations without triggering database lock contention or `SELECT` table scans.
-- **Medallion Lakehouse Storage:**
-  - **Bronze Layer:** Append-only raw changelog stored in Snappy-compressed Parquet with ingestion metadata (`_cdc_op`, `_cdc_ts_ms`, `_tx_id`, `_lsn`).
-  - **Silver Layer:** Cleaned, deduplicated, current-state tables implementing ACID `MERGE INTO` semantics.
-  - **Gold Layer:** Fast columnar analytical aggregations powered by **DuckDB** for executive KPIs and operational alerts.
-- **Out-of-Order Event Handling:** Deterministic reconciliation using timestamp and LSN comparisons. Stale updates arriving late due to network partitions or consumer restarts are discarded to prevent state regression.
-- **Poison Pill Isolation (DLQ):** Messages failing structural JSON checks or strict Pydantic V2 domain contracts are routed to an isolated quarantine repository with diagnostic stack traces, ensuring zero consumer downtime.
-- **Zero Spark Overhead:** Optimized using **PyArrow** and **DuckDB**, delivering sub-second lakehouse ingestion and analytics on lightweight commodity hardware.
+### 1. Medallion Lakehouse Structure
+- **Bronze (Raw Changelog):** Append-only Delta table preserving raw CDC envelopes with transaction metadata (`_cdc_op`, `_cdc_ts_ms`, `_lsn`, `tx_id`, `before`, `after`). Partitioned by date.
+- **Silver (Current State):** Cleaned, deduplicated entity tables (`orders`, `inventory`). Updated using Delta Lake `MERGE INTO` operations keyed by primary keys.
+- **Gold (Analytics):** Business views and aggregations queried directly using DuckDB over Delta Parquet files (e.g. low-stock alerts, customer order velocity).
+
+### 2. Out-of-Order Event Handling & LSN Ordering
+In distributed streaming, network retries can cause messages to arrive out of order. Instead of relying solely on server timestamps (which can suffer from clock drift or share the same millisecond), the pipeline uses the PostgreSQL **Log Sequence Number (LSN)** as the primary monotonic ordering authority:
+```sql
+(COALESCE(source._lsn, 0) > COALESCE(target._lsn, 0))
+OR (COALESCE(source._lsn, 0) = COALESCE(target._lsn, 0) AND source.ts_ms >= target.ts_ms)
+```
+If an incoming event is older than the current record in the Silver table, the update is ignored.
+
+### 3. Tombstone Deletes
+When a record is deleted in PostgreSQL (`op = 'd'`), physically deleting the row in the Silver table risks "resurrecting" the row if a delayed, out-of-order update arrives later. The pipeline instead writes a tombstone (`_is_deleted = True`) while updating the LSN. Stale updates with an older LSN are safely rejected, while Gold analytics filter out tombstoned records with `WHERE COALESCE(_is_deleted, false) = false`.
+
+### 4. Error Handling & Dead Letter Queue (DLQ)
+- Malformed payloads and schema validation failures are written to `quarantine/` with diagnostic metadata (error reason, topic, partition, offset). The Kafka offset is committed so bad messages do not block the consumer.
+- For storage or Delta transaction failures, an exception is raised and the Kafka offset is **not** committed. On restart, the consumer replays the message idempotently.
 
 ---
 
-## Directory Structure
+## Project Structure
 
 ```
 enterprise-cdc-lakehouse/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                 # GitHub Actions CI workflow (linting, tests, replay)
 ├── analytics/
-│   ├── __init__.py
-│   └── gold_analytics.py          # DuckDB OLAP queries over Silver & Bronze layers
+│   └── gold_analytics.py            # DuckDB queries over Delta Lake tables
 ├── connectors/
-│   ├── postgres-connector.json    # Debezium PostgreSQL connector configuration
-│   └── register-postgres.sh       # Automated Kafka Connect registration script
+│   ├── postgres-connector.json      # Debezium PostgreSQL connector config
+│   └── register-postgres.sh         # Connector registration script
 ├── pipeline/
-│   ├── __init__.py
-│   ├── consumer.py                # Streaming CDC consumer & routing engine
-│   ├── delta_engine.py            # Bronze append, Silver MERGE INTO & DLQ quarantine
-│   └── models.py                  # Pydantic V2 schemas for Debezium envelopes & entities
+│   ├── consumer.py                  # Kafka streaming consumer with manual commits & DLQ
+│   ├── delta_engine.py              # Bronze/Silver Delta Lake writer & MERGE logic
+│   └── models.py                    # Pydantic schemas for CDC events & domain entities
 ├── scripts/
-│   └── simulate_erp_transactions.py # High-fidelity CDC event stream generator
+│   ├── benchmark_latency.py         # Latency and throughput benchmark
+│   ├── bootstrap.sh                 # Environment startup script
+│   ├── demo.sh                      # End-to-end pipeline demonstration
+│   ├── simulate_erp_transactions.py # Generates test transactions
+│   └── verify_live_stack_e2e.py     # Live integration test against Docker stack
 ├── sql/
-│   └── init.sql                   # Schema definitions, seed rows, and WAL publication
+│   └── init.sql                     # PostgreSQL schema and replication publication setup
 ├── tests/
-│   └── test_cdc_pipeline.py       # Comprehensive pytest suite
-├── ARCHITECTURE.md                # In-depth architectural design and ADR documentation
-├── docker-compose.yml             # Local infrastructure (Postgres, Redpanda, Debezium, MinIO)
-├── requirements.txt               # Production dependencies
+│   ├── test_cdc_pipeline.py         # Core pipeline tests
+│   ├── test_unit_pipeline.py        # Unit tests (schemas, ordering logic, DLQ)
+│   └── test_integration_cdc.py      # End-to-end stream replay and crash recovery
+├── docker-compose.yml               # Local infrastructure (Postgres, Redpanda, Debezium)
+├── requirements.txt                 # Python dependencies
 └── README.md
 ```
 
 ---
 
-## Quickstart Guide
+## Quickstart
 
-### 1. Prerequisites
-- Python 3.11+ (or virtualenv)
-- Docker & Docker Compose (optional for local infrastructure deployment)
+### Prerequisites
+- Python 3.11+
+- Docker and Docker Compose (optional, for running live services)
 
-### 2. Installation
+### Installation
 ```bash
 git clone https://github.com/Jigar-23/enterprise-cdc-lakehouse.git
 cd enterprise-cdc-lakehouse
 
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Run the Test Suite
+### Running Tests
+Run the test suite:
 ```bash
-pytest -v tests/
+pytest -v
 ```
 
-### 4. Execute the End-to-End CDC Simulation
-Run the standalone transaction simulator to experience WAL ingestion, Silver upsert, and DLQ quarantine in action:
+### Running the Demo
+An offline end-to-end demo processes sample CDC events through Bronze, Silver, DLQ, and Gold analytics:
 ```bash
-python scripts/simulate_erp_transactions.py
+./scripts/demo.sh
 ```
 
-### 5. Query Gold Analytics
+### Running Benchmarks
+Measure end-to-end ingestion latency and throughput:
 ```bash
-python analytics/gold_analytics.py
-```
-
----
-
-## Full Infrastructure Deployment (Optional)
-
-To spin up the distributed infrastructure (Postgres, Redpanda, Debezium, MinIO):
-```bash
-# 1. Start containers
-docker-compose up -d
-
-# 2. Register Debezium connector
-./connectors/register-postgres.sh
-
-# 3. Access management UIs:
-#    - Redpanda Console: http://localhost:8080
-#    - Debezium Connect: http://localhost:8083
-#    - MinIO Object Storage: http://localhost:9001 (minioadmin / minioadmin)
+python3 scripts/benchmark_latency.py --events 100
 ```
 
 ---
 
-## Interview Talking Points & Design Rationale
+## Running with Docker Compose
 
-### 1. Why Log-Based CDC over Polling (JDBC)?
-Polling databases using timestamps (`WHERE updated_at > last_poll`) imposes significant query load, requires indexes on updated columns, misses hard `DELETE` operations, and fails to capture rapid intermediate state changes. Reading directly from the Write-Ahead Log (WAL) via Debezium eliminates query load on production OLTP databases and captures exact, atomic state changes.
+To run the full stack locally with PostgreSQL, Redpanda, Debezium, and the consumer:
 
-### 2. How are Out-of-Order Events Handled?
-Distributed event streaming can lead to out-of-order message delivery. The `DeltaLakehouseEngine.merge_silver()` method checks `incoming.ts_ms >= existing.ts_ms`. If a delayed event arrives with an older timestamp than the row's current state, it is safely ignored, guaranteeing data consistency.
+1. **Start infrastructure:**
+   ```bash
+   ./scripts/bootstrap.sh
+   ```
+   Or manually:
+   ```bash
+   docker compose up -d postgres-source kafka connect redpanda-console
+   ./connectors/register-postgres.sh
+   docker compose up -d cdc-consumer
+   ```
 
-### 3. How does this serve Continental ContiTech?
-In high-throughput automotive manufacturing (e.g., ContiTech tire and hose plants), ERP systems process thousands of JIT/JIS inventory adjustments. Sub-second CDC streaming into an ACID lakehouse enables real-time supply chain visibility, automated supplier replenishment, and predictive parts allocation.
+2. **Web UIs:**
+   - Redpanda Console: [http://localhost:8080](http://localhost:8080)
+   - Debezium Connect API: [http://localhost:8083/connectors](http://localhost:8083/connectors)
+
+3. **Verify live pipeline:**
+   ```bash
+   python3 scripts/verify_live_stack_e2e.py
+   ```
 
 ---
 
 ## License
-Distributed under the Apache 2.0 License. See `LICENSE` for more information.
+
+Apache 2.0

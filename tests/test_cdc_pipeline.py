@@ -82,13 +82,14 @@ def test_cdc_envelope_validation():
     # Valid INSERT envelope
     valid_env = {
         "op": "c",
+        "source": {"table": "orders"},
         "after": {"order_id": "ORD-1", "customer_id": "CUST-1", "product_id": "P1", "quantity": 1, "total_price": 10.0}
     }
     env = CDCEnvelope(**valid_env)
     assert env.op == "c"
 
     # Invalid INSERT without 'after'
-    invalid_env = {"op": "c", "after": None}
+    invalid_env = {"op": "c", "source": {"table": "orders"}, "after": None}
     with pytest.raises(ValidationError):
         CDCEnvelope(**invalid_env)
 
@@ -107,9 +108,9 @@ def test_bronze_append(temp_lakehouse):
     assert count == 2
 
     bronze_dir = os.path.join(storage_path, "bronze", "orders")
-    files = os.listdir(bronze_dir)
-    assert len(files) == 1
-    df = pd.read_parquet(os.path.join(bronze_dir, files[0]))
+    from deltalake import DeltaTable
+    assert DeltaTable.is_deltatable(bronze_dir)
+    df = engine.get_bronze_table("orders")
     assert len(df) == 2
     assert "_ingested_at" in df.columns
 
